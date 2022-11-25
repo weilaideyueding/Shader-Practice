@@ -1,0 +1,399 @@
+Properties
+    {
+        _MainTex ("Main Tex", 2D) = "white"{}
+		_LayerTex ("Laryer", 2D) = "white" {}
+        
+        _OcclusionColor ("AO Color", Color) = (0,0,0,0)
+        _LightFilter ("光照范围", Range(-0.8, 0.1)) = 0
+        
+        _SpecColor1 ("高光颜色 1", Color) = (0,0,0,0)
+        _SpecColor2 ("高光颜色 2", Color) = (0,0,0,0)
+        _SpecExp ("高光范围", Vector) = (50, 50, 0, 0) 
+        
+        [Space(10)]
+        _FurLength ("毛发长度", Range(0.001, 1)) = 0.25
+        
+        [Space(10)]
+        [Header(Gravity)]
+		_Gravity ("重力方向", Vector) = (0,-1,0,0)
+		_GravityStrength ("重力大小", Range(0,1)) = 0.25
+        
+        [Space(10)]
+        [Header(UV Niose)]
+        _UVoffset ("UV偏移：XY=UV偏移;ZW=UV扰动", Vector) = (0, 0, 0.2, 0.2)
+        
+        
+    }
+    SubShader
+    {
+        // 注意混合
+        Blend SrcAlpha OneMinusSrcAlpha
+        
+        Tags{"LightMode"="ForwardBase"}
+        
+        CGINCLUDE
+        #include "UnityCG.cginc"
+        #include "Lighting.cginc"
+
+        struct appdata
+        {
+            float4 vertex : POSITION;
+            float2 uv : TEXCOORD0;
+            float3 normal : NORMAL;
+            float4 tangent : TANGENT;
+        };
+
+        struct v2f
+        {
+
+            float4 vertex : SV_POSITION;
+            float4 uv : TEXCOORD0;
+            float3 worldPos : TEXCOORD1;
+            float3 nDirWS : TEXCOORD2;
+            half3 SH : TEXCOORD3;
+            half3 SHL : TEXCOORD4;
+            half RimLight : TEXCOORD5;
+            half3 diffuse : TEXCOORD6;
+            half3 specular : TEXCOORD7;
+        };
+
+        sampler2D _MainTex, _LayerTex;
+        float4 _MainTex_ST;
+        float4 _LayerTex_ST;
+
+        half3 _OcclusionColor;
+        half _LightFilter;
+
+        // sampler2D _ShiftMap;
+        half3 _SpecColor1, _SpecColor2;
+        half4 _SpecExp;
+
+        half _FurLength;
+        half3 _Gravity;
+        half _GravityStrength;
+        
+        half4 _UVoffset;
+
+        // 副切线偏移, T是副切线
+        float3 TShift(float3 T, float3 normal, half shift)
+        {
+            return normalize(T + shift * normal);
+        }
+
+        // 计算高光
+        float StrandSpecular(float3 t, float3 v, float3 l, half exponent)
+        {
+            float3 h = normalize(v + l);
+            float dotTH = dot(t, h);
+            float sinTH = sqrt(1.0 - dotTH * dotTH);
+            float dirAtten = smoothstep(-1.0, 0.0, dotTH);
+
+            return dirAtten * pow(sinTH, exponent);
+        }
+
+        v2f hair_vertex (appdata v, half FUR_OFFSET)
+        {
+            v2f o;
+            // 计算偏移量
+            float3 nDirOS = v.normal;
+            // 重力因素 一部分用重力方向，另一部分一部分用法线
+            float3 direction = lerp(nDirOS, _Gravity * _GravityStrength + nDirOS * (1 - _GravityStrength), FUR_OFFSET);
+            // 偏移顶点
+            v.vertex.xyz += direction * _FurLength  * FUR_OFFSET;
+
+            // 沿法线挤出距离
+            o.vertex = UnityObjectToClipPos(v.vertex);
+
+            o.worldPos = mul(unity_ObjectToWorld, v.vertex);
+			o.nDirWS = normalize(mul(unity_ObjectToWorld, half4(v.normal, 0)).xyz);
+
+            float2 uvOffset = _UVoffset.xy * FUR_OFFSET;
+            uvOffset *= 0.1;
+            o.uv.xy = TRANSFORM_TEX(v.uv, _MainTex) + uvOffset;
+            o.uv.zw = TRANSFORM_TEX(v.uv, _LayerTex) + uvOffset;
+
+            // 在顶点中计算光照，减少消耗
+            
+            float3 nDirWS = normalize(o.nDirWS);
+            float3 vDirWS = normalize(_WorldSpaceCameraPos - o.worldPos);
+            float3 lDirWS = normalize(_WorldSpaceLightPos0);
+            float3 bDirOS = normalize(cross(nDirOS, v.tangent.xyz) * v.tangent.w);
+
+            float3 bDirWS = UnityObjectToWorldDir(bDirOS);
+
+            // 漫反射
+            half nl = dot(nDirWS, lDirWS);
+            half DirLight = saturate(nl + FUR_OFFSET + _LightFilter);  // nl 值为(-1, 1), 与层数相加，得到暗部部分的上层转为亮部，模拟遮挡
+
+            half3 diffuse = DirLight * _LightColor0.xyz;
+            o.diffuse = diffuse + 0.04; // 使暗部还有一定的颜色
+
+            // 镜面反射
+            float3 T1 = TShift(bDirWS, nDirWS, _SpecExp.z); // 计算切线偏移，因为顶点不能采样贴图，使用值代替，并在输出时乘透明度来模拟抖动图
+            float3 T2 = TShift(bDirWS, nDirWS, _SpecExp.w);
+            float spec1 = StrandSpecular(T1, vDirWS, lDirWS, _SpecExp.x) * FUR_OFFSET;
+            float spec2 = StrandSpecular(T2, vDirWS, lDirWS, _SpecExp.y) * FUR_OFFSET;
+            o.specular = spec1 * _SpecColor1 + spec2 * _SpecColor2;
+
+            // 环境光：使用简单的顶底颜色
+            float3 nDirVS = normalize(mul(UNITY_MATRIX_V, o.nDirWS));
+            half3 SH =  saturate(nDirVS.y * 0.25 + 0.35);
+            o.SH = SH;
+
+            // AO
+            // 越向上，AO越弱
+            half Occlusion = FUR_OFFSET * FUR_OFFSET;
+            Occlusion += 0.04;  // 保证最底层不为0
+            o.SHL = lerp(SH * _OcclusionColor, SH, Occlusion);  //环境遮蔽也有颜色
+            
+            // 边缘光
+            half Fresnel = pow(1-max(0,dot(nDirWS, vDirWS)),2.2) ; // Fresnel
+            half RimLight = Fresnel * Occlusion;    // AO的影响
+            RimLight *= diffuse;    // 为了让暗部的边缘光不那么亮
+            // RimLight *= RimLight;
+            // RimLight *= SH; // 环境光因素，可以再添加一个参数控制
+
+            o.SHL += RimLight; // AO加上边缘光
+            
+            o.RimLight = RimLight;
+            
+            return o;
+        }
+
+        fixed4 hair_fragment (v2f i, half FUR_OFFSET) : SV_Target
+        {
+            // 光照
+            
+            fixed alpha = tex2D(_LayerTex, i.uv.zw).r;
+            
+            half4 Color;
+            Color.rgb = tex2D(_MainTex, i.uv.xy).rgb;
+            Color.a = saturate(alpha - FUR_OFFSET);
+
+            half3 env = i.SH * i.SHL + i.RimLight;
+            half3 specular = i.specular * alpha * alpha;    // 弥补体积并替代抖动图
+            
+            half3 finalCol = Color.xyz * i.diffuse;
+            finalCol += specular;
+            finalCol += env;
+
+return half4(finalCol, Color.a);
+            return Color;;
+        }
+        
+        v2f vert0 (appdata v)
+        {
+            return hair_vertex(v, 0);
+        }
+
+        v2f vert1 (appdata v)
+        {
+            return hair_vertex(v, 0.1);
+        }
+
+        v2f vert2 (appdata v)
+        {
+            return hair_vertex(v, 0.2);
+        }
+
+        v2f vert3 (appdata v)
+        {
+            return hair_vertex(v, 0.3);
+        }
+
+        v2f vert4 (appdata v)
+        {
+            return hair_vertex(v, 0.4);
+        }
+
+        v2f vert5 (appdata v)
+        {
+            return hair_vertex(v, 0.5);
+        }
+
+        v2f vert6 (appdata v)
+        {
+            return hair_vertex(v, 0.6);
+        }
+
+        v2f vert7 (appdata v)
+        {
+            return hair_vertex(v, 0.7);
+        }
+
+        v2f vert8 (appdata v)
+        {
+            return hair_vertex(v, 0.8);
+        }
+
+        v2f vert9 (appdata v)
+        {
+            return hair_vertex(v, 0.9);
+        }
+        
+        v2f vert10 (appdata v)
+        {
+            return hair_vertex(v, 1.0);
+        }
+        
+
+		fixed4 frag0(v2f i) : SV_Target
+		{
+		    float3 color = tex2D(_MainTex, i.uv.xy);
+
+		    return float4(i.diffuse * color * 0.5, 1);
+		}   
+
+        fixed4 frag1(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.1);
+		}
+
+        fixed4 frag2(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.2);
+		}
+        
+        fixed4 frag3(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.3);
+		}
+
+        fixed4 frag4(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.4);
+		}
+
+        fixed4 frag5(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.5);
+		}
+
+        fixed4 frag6(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.6);
+		}
+
+        fixed4 frag7(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.7);
+		}
+
+        fixed4 frag8(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.8);
+		}
+
+        fixed4 frag9(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 0.9);
+		}
+
+        fixed4 frag10(v2f i) : SV_Target
+		{
+			return hair_fragment(i, 1.0);
+		}
+        
+        
+        ENDCG
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert0;
+            #pragma fragment frag0;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert1;
+            #pragma fragment frag1;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert2;
+            #pragma fragment frag2;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert3;
+            #pragma fragment frag3;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert4;
+            #pragma fragment frag4;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert5;
+            #pragma fragment frag5;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert6;
+            #pragma fragment frag6;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert7;
+            #pragma fragment frag7;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert8;
+            #pragma fragment frag8;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert9;
+            #pragma fragment frag9;
+            
+            ENDCG
+        }
+        
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert10;
+            #pragma fragment frag10;
+            
+            ENDCG
+        }
+        
+    }
